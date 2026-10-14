@@ -130,6 +130,7 @@ docker run -d \
     --network "$SERVER_NET" \
     --ip "$SERVER_IP" \
     --cap-drop ALL \
+    --cap-add NET_ADMIN \
     --memory 256m --cpus 0.5 --pids-limit 128 \
     lab-server:local
 
