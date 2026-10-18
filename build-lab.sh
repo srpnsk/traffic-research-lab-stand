@@ -21,6 +21,8 @@ FILTER_CLIENT_IP="10.231.10.2"
 FILTER_SERVER_IP="10.231.20.2"
 SERVER_IP="10.231.20.3"
 
+docker volume create lab-workspace
+
 if [[ "${1:-}" == "--reset" ]]; then
     echo "Removing only the resources named by this lab..."
     docker rm -f "$CLIENT" "$FILTER" "$SERVER" 2>/dev/null || true
@@ -64,19 +66,19 @@ chmod 700 "$ROOT/captures"
 
 cat >"$ROOT/client/Dockerfile" <<'EOF'
 FROM alpine:3.22
-RUN apk add --no-cache iproute2 curl tcpdump python3
+RUN apk add --no-cache iproute2 curl tcpdump python3 bash
 CMD ["sleep", "infinity"]
 EOF
 
 cat >"$ROOT/filter/Dockerfile" <<'EOF'
 FROM alpine:3.22
-RUN apk add --no-cache iproute2 tcpdump
+RUN apk add --no-cache iproute2 tcpdump bash
 CMD ["sleep", "infinity"]
 EOF
 
 cat >"$ROOT/server/Dockerfile" <<'EOF'
 FROM alpine:3.22
-RUN apk add --no-cache iproute2 python3
+RUN apk add --no-cache iproute2 python3 bash
 RUN mkdir -p /srv/www \
     && printf 'Hello from the lab server\n' > /srv/www/index.html
 EXPOSE 8080
@@ -85,9 +87,9 @@ CMD ["python3", "-m", "http.server", "8080", \
 EOF
 
 echo "Building images..."
-docker build -t lab-client:local "$ROOT/client"
-docker build -t lab-filter:local "$ROOT/filter"
-docker build -t lab-server:local "$ROOT/server"
+docker build -t lab-client:local --mount type=bind,src=/srv/network-lab/workspace,dst=/workspace "$ROOT/client"
+docker build -t lab-filter:local --mount type=bind,src=/srv/network-lab/workspace,dst=/workspace "$ROOT/filter"
+docker build -t lab-server:local --mount type=bind,src=/srv/network-lab/workspace,dst=/workspace "$ROOT/server"
 
 echo "Creating isolated networks..."
 docker network create \
@@ -108,7 +110,7 @@ docker run -d \
     --cap-add NET_RAW \
     --sysctl net.ipv4.ip_forward=1 \
     --memory 256m --cpus 0.5 --pids-limit 128 \
-    --mount "type=bind,src=$ROOT/captures,dst=/captures" \
+    --mount type=bind,src=/srv/network-lab/captures,dst=/captures \
     lab-filter:local
 
 docker network connect \
@@ -121,6 +123,7 @@ docker run -d \
     --ip "$CLIENT_IP" \
     --cap-drop ALL \
     --cap-add NET_ADMIN \
+    --mount type=volume,src=lab-workspace,dst=/workspace \
     --memory 256m --cpus 0.5 --pids-limit 128 \
     lab-client:local
 
@@ -131,6 +134,7 @@ docker run -d \
     --ip "$SERVER_IP" \
     --cap-drop ALL \
     --cap-add NET_ADMIN \
+    --mount type=volume,src=lab-workspace,dst=/workspace \
     --memory 256m --cpus 0.5 --pids-limit 128 \
     lab-server:local
 
