@@ -87,9 +87,9 @@ CMD ["python3", "-m", "http.server", "8080", \
 EOF
 
 echo "Building images..."
-docker build -t lab-client:local --mount type=bind,src=/srv/network-lab/workspace,dst=/workspace "$ROOT/client"
-docker build -t lab-filter:local --mount type=bind,src=/srv/network-lab/workspace,dst=/workspace "$ROOT/filter"
-docker build -t lab-server:local --mount type=bind,src=/srv/network-lab/workspace,dst=/workspace "$ROOT/server"
+docker build -t lab-client:local "$ROOT/client"
+docker build -t lab-filter:local "$ROOT/filter"
+docker build -t lab-server:local "$ROOT/server"
 
 echo "Creating isolated networks..."
 docker network create \
