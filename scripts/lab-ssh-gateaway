@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+choose_node() {
+    echo
+    echo "Network research lab"
+    echo "1) client"
+    echo "2) filter"
+    echo "3) server"
+    echo "4) status"
+    echo "q) quit"
+    read -r -p "Select: " choice
+
+    case "$choice" in
+        1) exec sudo -n -u dockerroot /usr/local/sbin/labctl shell client ;;
+        2) exec sudo -n -u dockerroot /usr/local/sbin/labctl shell filter ;;
+        3) exec sudo -n -u dockerroot /usr/local/sbin/labctl shell server ;;
+        4) exec sudo -n -u dockerroot /usr/local/sbin/labctl status ;;
+        q) exit 0 ;;
+        *) echo "Invalid selection." >&2; exit 2 ;;
+    esac
+}
+
+original="${SSH_ORIGINAL_COMMAND:-}"
+
+if [[ -z "$original" ]]; then
+    choose_node
+fi
+
+case "$original" in
+    "shell client")
+        exec sudo -n -u dockerroot /usr/local/sbin/labctl shell client
+        ;;
+    "shell filter")
+        exec sudo -n -u dockerroot /usr/local/sbin/labctl shell filter
+        ;;
+    "shell server")
+        exec sudo -n -u dockerroot /usr/local/sbin/labctl shell server
+        ;;
+    "status")
+        exec sudo -n -u dockerroot /usr/local/sbin/labctl status
+        ;;
+    *)
+        echo "Command not allowed by the lab gateway." >&2
+        exit 126
+        ;;
+esac

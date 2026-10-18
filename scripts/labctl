@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
+
+action="${1:-}"
+node="${2:-}"
+
+case "$action" in
+    status)
+        [[ $# -eq 1 ]] || exit 2
+        exec docker ps \
+          --filter name=lab-client \
+          --filter name=lab-filter \
+          --filter name=lab-server \
+          --format 'table {{.Names}}\t{{.Status}}'
+        ;;
+
+    shell)
+        [[ $# -eq 2 ]] || {
+            echo "Usage: labctl shell client|filter|server" >&2
+            exit 2
+        }
+
+        case "$node" in
+            client) container="lab-client" ;;
+            filter) container="lab-filter" ;;
+            server) container="lab-server" ;;
+            *)
+                echo "Unknown lab node." >&2
+                exit 2
+                ;;
+        esac
+
+        exec docker exec -it \
+          --user 0 \
+          --workdir /workspace \
+          "$container" /bin/bash
+        ;;
+
+    *)
+        echo "Unsupported operation." >&2
+        exit 2
+        ;;
+esac

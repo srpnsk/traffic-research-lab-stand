@@ -1,0 +1,7 @@
+[Unit]
+Description=Expire old network lab captures
+
+[Service]
+Type=oneshot
+User=dockerroot
+ExecStart=/usr/bin/python3 /usr/local/sbin/lab-prune-captures.py

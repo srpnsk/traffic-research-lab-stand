@@ -1,0 +1,1 @@
+%labusers ALL=(dockerroot) NOPASSWD: /usr/local/sbin/labctl shell client, /usr/local/sbin/labctl shell filter, /usr/local/sbin/labctl shell server, /usr/local/sbin/labctl status

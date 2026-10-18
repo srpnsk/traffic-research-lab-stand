@@ -1,0 +1,10 @@
+lab.example.org {
+    basicauth {
+        attacker $2a$14$REPLACE_WITH_REAL_HASH
+        defender $2a$14$REPLACE_WITH_REAL_HASH
+        ml-searcher $2a$14$REPLACE_WITH_REAL_HASH
+    }
+
+    root * /srv/network-lab/captures
+    file_server browse
+}
