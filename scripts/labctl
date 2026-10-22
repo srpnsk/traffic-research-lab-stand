@@ -1,19 +1,51 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
+readonly DOCKER_USER="dockerroot"
+readonly DOCKER_HOME="/home/${DOCKER_USER}"
+readonly DOCKER_UID="$(id -u "$DOCKER_USER")"
+readonly DOCKER_SOCKET="/run/user/${DOCKER_UID}/docker.sock"
+readonly DOCKER_BIN="${DOCKER_HOME}/bin/docker"
 
 action="${1:-}"
 node="${2:-}"
 
+# labctl должен работать в контексте владельца Rootless Docker.
+if [[ "$(id -un)" != "$DOCKER_USER" ]]; then
+    echo "labctl must run as ${DOCKER_USER}." >&2
+    exit 1
+fi
+
+# Rootless Docker устанавливает CLI в ~/bin.
+# Используем абсолютный путь, чтобы не зависеть от SSH/sudo PATH.
+if [[ ! -x "$DOCKER_BIN" ]]; then
+    echo "Docker CLI not found: ${DOCKER_BIN}" >&2
+    echo "Check the Rootless Docker installation for ${DOCKER_USER}." >&2
+    exit 127
+fi
+
+export HOME="$DOCKER_HOME"
+export PATH="${DOCKER_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+export DOCKER_HOST="unix://${DOCKER_SOCKET}"
+
+if [[ ! -S "$DOCKER_SOCKET" ]]; then
+    echo "Docker socket not found: ${DOCKER_SOCKET}" >&2
+    echo "Check whether the Rootless Docker service is running." >&2
+    exit 1
+fi
+
 case "$action" in
     status)
-        [[ $# -eq 1 ]] || exit 2
-        exec docker ps \
-          --filter name=lab-client \
-          --filter name=lab-filter \
-          --filter name=lab-server \
-          --format 'table {{.Names}}\t{{.Status}}'
+        [[ $# -eq 1 ]] || {
+            echo "Usage: labctl status" >&2
+            exit 2
+        }
+
+        "$DOCKER_BIN" ps \
+            --filter name=lab-client \
+            --filter name=lab-filter \
+            --filter name=lab-server \
+            --format 'table {{.Names}}\t{{.Status}}'
         ;;
 
     shell)
@@ -32,14 +64,14 @@ case "$action" in
                 ;;
         esac
 
-        exec docker exec -it \
-          --user 0 \
-          --workdir /workspace \
-          "$container" /bin/bash
+        exec "$DOCKER_BIN" exec -it \
+            --user 0 \
+            --workdir /workspace \
+            "$container" /bin/bash
         ;;
 
     *)
-        echo "Unsupported operation." >&2
+        echo "Usage: labctl status | shell client|filter|server" >&2
         exit 2
         ;;
 esac
