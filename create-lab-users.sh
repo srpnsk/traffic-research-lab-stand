@@ -15,7 +15,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 if [[ $# -ne 1 ]]; then
-    echo "Использование: sudo $0 <attacker|defender|ml-searcher>" >&2
+    echo "Использование: sudo $0 <attacker|defender|ml-searcher|leader>" >&2
     exit 1
 fi
 
@@ -25,7 +25,7 @@ case "$USERNAME" in
 attacker | defender | ml-searcher) ;;
 *)
     echo "Неизвестный пользователь: $USERNAME" >&2
-    echo "Допустимые имена: attacker, defender, ml-searcher" >&2
+    echo "Допустимые имена: attacker, defender, ml-searcher, leader" >&2
     exit 1
     ;;
 esac
