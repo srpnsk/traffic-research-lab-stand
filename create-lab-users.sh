@@ -22,7 +22,7 @@ fi
 USERNAME="$1"
 
 case "$USERNAME" in
-attacker | defender | ml-searcher) ;;
+attacker | defender | ml-searcher | leader) ;;
 *)
     echo "Неизвестный пользователь: $USERNAME" >&2
     echo "Допустимые имена: attacker, defender, ml-searcher, leader" >&2
