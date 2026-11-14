@@ -43,10 +43,10 @@ die() {
 
 get_container() {
     case "${1:-}" in
-    client) printf '%s\n' lab-client ;;
-    filter) printf '%s\n' lab-filter ;;
-    server) printf '%s\n' lab-server ;;
-    *) die "Unknown node: ${1:-<empty>}. Use client, filter or server." ;;
+        client) printf '%s\n' lab-client ;;
+        filter) printf '%s\n' lab-filter ;;
+        server) printf '%s\n' lab-server ;;
+        *) die "Unknown node: ${1:-<empty>}. Use client, filter or server." ;;
     esac
 }
 
@@ -130,15 +130,15 @@ fetch_alpine_packages() (
     helper_image="alpine:${branch#v}"
 
     case "$mode" in
-    install)
-        (($# > 0)) || die "No packages specified."
-        ;;
-    upgrade)
-        (($# == 0)) || die "Unexpected arguments for upgrade."
-        ;;
-    *)
-        die "Internal error: unknown package operation: $mode"
-        ;;
+        install)
+            (($# > 0)) || die "No packages specified."
+            ;;
+        upgrade)
+            (($# == 0)) || die "Unexpected arguments for upgrade."
+            ;;
+        *)
+            die "Internal error: unknown package operation: $mode"
+            ;;
     esac
 
     # Не допускаем передачу произвольных параметров APK.
@@ -177,9 +177,7 @@ fetch_alpine_packages() (
         "$container:/etc/apk/keys/." \
         "$workdir/keys/"
 
-    # Загрузчик не подключается к сетям лабораторных узлов.
-    "$DOCKER_BIN" image inspect "$helper_image" >/dev/null 2>&1 ||
-        "$DOCKER_BIN" pull "$helper_image"
+    "$DOCKER_BIN" pull "$helper_image"
 
     "$DOCKER_BIN" run --rm \
         --network bridge \
@@ -210,9 +208,17 @@ fetch_alpine_packages() (
             # Обновляем индексы репозиториев.
             $APK update
 
+	   for f in "$ROOT"/var/cache/apk/APKINDEX.*.tar.gz; do
+                d=$(mktemp -d)
+	   	tar -xzf "$f" -C "$d"
+	   	sed -i 's/^A:noarch$/A:x86_64/' "$d/APKINDEX"
+	   	tar -czf "$f" -C "$d" APKINDEX
+	   	rm -rf "$d"
+	   done
+
             # Разрешаем зависимости с учётом установленной системы.
             if [ "$#" -gt 0 ]; then
-                $APK cache download --upgrade --add-dependencies "$@"
+                $APK cache download --add-dependencies "$@"
             else
                 $APK cache download --upgrade
             fi
@@ -258,52 +264,52 @@ package_command() {
     container="$(get_container "$node")"
 
     case "$operation" in
-    install)
-        (($# > 0)) || die "Usage: labctl pkg install NODE PACKAGE..."
-        fetch_alpine_packages "$container" install "$@"
-        ;;
-    upgrade)
-        (($# == 0)) || die "Usage: labctl pkg upgrade NODE"
-        echo "WARNING: this upgrades installed packages in $container."
-        read -r -p "Continue? [y/N] " answer
-        [[ "$answer" == "y" || "$answer" == "Y" ]] ||
-            return 0
-        fetch_alpine_packages "$container" upgrade
-        ;;
-    list)
-        (($# == 0)) || die "Usage: labctl pkg list NODE"
-        check_container "$container"
-        "$DOCKER_BIN" exec "$container" apk info
-        ;;
-    *)
-        die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
-        ;;
+        install)
+            (($# > 0)) || die "Usage: labctl pkg install NODE PACKAGE..."
+            fetch_alpine_packages "$container" install "$@"
+            ;;
+        upgrade)
+            (($# == 0)) || die "Usage: labctl pkg upgrade NODE"
+            echo "WARNING: this upgrades installed packages in $container."
+            read -r -p "Continue? [y/N] " answer
+            [[ "$answer" == "y" || "$answer" == "Y" ]] ||
+                return 0
+            fetch_alpine_packages "$container" upgrade
+            ;;
+        list)
+            (($# == 0)) || die "Usage: labctl pkg list NODE"
+            check_container "$container"
+            "$DOCKER_BIN" exec "$container" apk info
+            ;;
+        *)
+            die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
+            ;;
     esac
 }
 
 case "${1:-}" in
-status)
-    [[ $# -eq 1 ]] || die "Usage: labctl status"
-    node_status
-    ;;
+    status)
+        [[ $# -eq 1 ]] || die "Usage: labctl status"
+        node_status
+        ;;
 
-shell)
-    [[ $# -eq 2 ]] || die "Usage: labctl shell client|filter|server"
-    node_shell "$(get_container "$2")"
-    ;;
+    shell)
+        [[ $# -eq 2 ]] || die "Usage: labctl shell client|filter|server"
+        node_shell "$(get_container "$2")"
+        ;;
 
-info)
-    [[ $# -eq 2 ]] || die "Usage: labctl info client|filter|server"
-    node_info "$(get_container "$2")"
-    ;;
+    info)
+        [[ $# -eq 2 ]] || die "Usage: labctl info client|filter|server"
+        node_info "$(get_container "$2")"
+        ;;
 
-pkg)
-    (($# >= 3)) || die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
-    package_command "$2" "$3" "${@:4}"
-    ;;
+    pkg)
+        (($# >= 3)) || die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
+        package_command "$2" "$3" "${@:4}"
+        ;;
 
-*)
-    cat >&2 <<'USAGE'
+    *)
+        cat >&2 <<'USAGE'
 Usage:
   labctl status
   labctl shell client|filter|server
@@ -312,6 +318,6 @@ Usage:
   labctl pkg upgrade NODE
   labctl pkg list NODE
 USAGE
-    exit 2
-    ;;
+        exit 2
+        ;;
 esac
