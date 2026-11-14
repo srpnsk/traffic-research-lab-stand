@@ -1,27 +1,29 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+# labctl — пользовательский интерфейс лаборатории.
+# Запускается только от имени dockerroot через SSH gateway.
+
 readonly DOCKER_USER="dockerroot"
 readonly DOCKER_HOME="/home/${DOCKER_USER}"
 readonly DOCKER_UID="$(id -u "$DOCKER_USER")"
 readonly DOCKER_SOCKET="/run/user/${DOCKER_UID}/docker.sock"
+readonly LAB_ROOT="/srv/network-lab"
+readonly PACKAGE_CACHE="${LAB_ROOT}/package-cache"
 
-# Определяем расположение Docker CLI.
 DOCKER_BIN="$(command -v docker || true)"
-
 if [[ -z "$DOCKER_BIN" && -x "${DOCKER_HOME}/bin/docker" ]]; then
     DOCKER_BIN="${DOCKER_HOME}/bin/docker"
+fi
+
+if [[ "$(id -un)" != "$DOCKER_USER" ]]; then
+    echo "labctl must run as ${DOCKER_USER}." >&2
+    exit 1
 fi
 
 if [[ -z "$DOCKER_BIN" || ! -x "$DOCKER_BIN" ]]; then
     echo "Docker CLI not found." >&2
     exit 127
-fi
-
-# labctl должен запускаться от имени dockerroot.
-if [[ "$(id -un)" != "$DOCKER_USER" ]]; then
-    echo "labctl must run as ${DOCKER_USER}." >&2
-    exit 1
 fi
 
 export HOME="$DOCKER_HOME"
@@ -32,49 +34,38 @@ if [[ ! -S "$DOCKER_SOCKET" ]]; then
     exit 1
 fi
 
-case "${1:-}" in
-status)
-    [[ $# -eq 1 ]] || {
-        echo "Usage: labctl status" >&2
-        exit 2
-    }
+mkdir -p "$PACKAGE_CACHE"
 
-    exec "$DOCKER_BIN" ps \
-        --filter name=lab-client \
-        --filter name=lab-filter \
-        --filter name=lab-server \
-        --format 'table {{.Names}}\t{{.Status}}'
-    ;;
+die() {
+    echo "labctl: $*" >&2
+    exit 1
+}
 
-shell)
-    [[ $# -eq 2 ]] || {
-        echo "Usage: labctl shell client|filter|server" >&2
-        exit 2
-    }
-
-    case "$2" in
-    client) container="lab-client" ;;
-    filter) container="lab-filter" ;;
-    server) container="lab-server" ;;
-    *)
-        echo "Unknown lab node." >&2
-        exit 2
-        ;;
+get_container() {
+    case "${1:-}" in
+    client) printf '%s\n' lab-client ;;
+    filter) printf '%s\n' lab-filter ;;
+    server) printf '%s\n' lab-server ;;
+    *) die "Unknown node: ${1:-<empty>}. Use client, filter or server." ;;
     esac
+}
 
-    if ! "$DOCKER_BIN" inspect "$container" >/dev/null 2>&1; then
-        echo "Container not found: ${container}" >&2
-        exit 1
-    fi
+check_container() {
+    local container="$1"
 
-    if ! "$DOCKER_BIN" inspect \
-        --format '{{.State.Running}}' "$container" | grep -qx true; then
-        echo "Container is not running: ${container}" >&2
-        exit 1
-    fi
+    "$DOCKER_BIN" inspect "$container" >/dev/null 2>&1 ||
+        die "Container not found: $container"
 
-    # Используем /workspace, только если он реально существует.
-    workdir="/"
+    [[ "$("$DOCKER_BIN" inspect --format '{{.State.Running}}' "$container")" == "true" ]] ||
+        die "Container is not running: $container"
+}
+
+node_shell() {
+    local container="$1"
+    local workdir="/"
+
+    check_container "$container"
+
     if "$DOCKER_BIN" exec "$container" test -d /workspace; then
         workdir="/workspace"
     fi
@@ -83,10 +74,211 @@ shell)
         --user 0 \
         --workdir "$workdir" \
         "$container" /bin/sh
+}
+
+node_info() {
+    local container="$1"
+    check_container "$container"
+
+    echo "Container: $container"
+    "$DOCKER_BIN" exec "$container" /bin/sh -c '
+        if [ -f /etc/os-release ]; then
+            cat /etc/os-release
+        fi
+        echo
+        echo "Architecture:"
+        uname -m
+        if command -v apk >/dev/null 2>&1; then
+            echo "Alpine:"
+            cat /etc/alpine-release
+            echo "APK architecture:"
+            apk --print-arch
+        fi
+    '
+}
+
+node_status() {
+    "$DOCKER_BIN" ps \
+        --filter name=lab-client \
+        --filter name=lab-filter \
+        --filter name=lab-server \
+        --format 'table {{.Names}}\t{{.Status}}'
+}
+
+# Загружает пакеты через отдельный Alpine-контейнер.
+# Этот контейнер подключается только к обычной Docker bridge-сети,
+# а не к сетям лабораторных узлов.
+fetch_alpine_packages() {
+    local container="$1"
+    local mode="$2"
+    shift 2
+
+    local branch arch helper_image workdir
+    local -a packages=()
+
+    check_container "$container"
+
+    if ! "$DOCKER_BIN" exec "$container" command -v apk >/dev/null 2>&1; then
+        die "$container does not use Alpine Linux / apk."
+    fi
+
+    branch="$("$DOCKER_BIN" exec "$container" /bin/sh -c \
+        'awk -F. "{print "v" \$1 "." \$2}" /etc/alpine-release')"
+
+    arch="$("$DOCKER_BIN" exec "$container" apk --print-arch)"
+    helper_image="alpine:${branch#v}"
+
+    case "$mode" in
+    install)
+        packages=("$@")
+        ;;
+    upgrade)
+        mapfile -t packages < <(
+            "$DOCKER_BIN" exec "$container" apk info -e |
+                sed '/^[[:space:]]*$/d'
+        )
+        ((${#packages[@]} > 0)) ||
+            die "Could not obtain installed package list from $container."
+        ;;
+    *)
+        die "Internal error: unknown package operation: $mode"
+        ;;
+    esac
+
+    # Не допускаем передачу произвольных параметров apk.
+    local package
+    for package in "${packages[@]}"; do
+        [[ "$package" =~ ^[A-Za-z0-9+_.:-]+$ ]] ||
+            die "Invalid package name: $package"
+    done
+
+    workdir="$(mktemp -d "${PACKAGE_CACHE}/.work.XXXXXX")"
+    mkdir -p "$workdir/packages" "$workdir/keys"
+
+    cleanup() {
+        rm -rf -- "$workdir"
+    }
+    trap cleanup RETURN
+
+    echo "Target: $container"
+    echo "Alpine branch: $branch"
+    echo "Architecture: $arch"
+    echo "Download helper: $helper_image"
+
+    # Используем конфигурацию репозиториев и доверенные ключи самого узла.
+    "$DOCKER_BIN" cp \
+        "$container:/etc/apk/repositories" \
+        "$workdir/repositories"
+
+    "$DOCKER_BIN" cp \
+        "$container:/etc/apk/keys/." \
+        "$workdir/keys/"
+
+    # Образ загрузчика не подключается ни к одной сети стенда.
+    # bridge — отдельная стандартная сеть Docker.
+    "$DOCKER_BIN" image inspect "$helper_image" >/dev/null 2>&1 ||
+        "$DOCKER_BIN" pull "$helper_image"
+
+    "$DOCKER_BIN" run --rm \
+        --network bridge \
+        --mount "type=bind,src=${workdir},dst=/work" \
+        "$helper_image" \
+        /bin/sh -ec '
+            cp /work/repositories /etc/apk/repositories
+            cp -a /work/keys/. /etc/apk/keys/
+
+            apk update
+            apk fetch --recursive --output /work/packages "$@"
+        ' labctl-fetch "${packages[@]}"
+
+    compgen -G "$workdir/packages/*.apk" >/dev/null ||
+        die "No APK files were downloaded."
+
+    # Передаём пакеты в целевой узел.
+    "$DOCKER_BIN" exec "$container" mkdir -p /tmp/labctl-packages
+    "$DOCKER_BIN" cp \
+        "$workdir/packages/." \
+        "$container:/tmp/labctl-packages/"
+
+    # Устанавливаем исключительно из локальных файлов.
+    # --no-network запрещает apk обращаться к сетевым репозиториям.
+    "$DOCKER_BIN" exec "$container" /bin/sh -ec '
+        set -- /tmp/labctl-packages/*.apk
+        [ -f "$1" ] || {
+            echo "No local APK packages found." >&2
+            exit 1
+        }
+
+        apk add --no-network "$@"
+        rm -rf /tmp/labctl-packages
+    '
+
+    echo "Package operation completed for $container."
+}
+
+package_command() {
+    local operation="${1:-}"
+    local node="${2:-}"
+    shift 2 || true
+
+    local container
+    container="$(get_container "$node")"
+
+    case "$operation" in
+    install)
+        (($# > 0)) || die "Usage: labctl pkg install NODE PACKAGE..."
+        fetch_alpine_packages "$container" install "$@"
+        ;;
+    upgrade)
+        (($# == 0)) || die "Usage: labctl pkg upgrade NODE"
+        echo "WARNING: this upgrades installed packages in $container."
+        read -r -p "Continue? [y/N] " answer
+        [[ "$answer" == "y" || "$answer" == "Y" ]] ||
+            return 0
+        fetch_alpine_packages "$container" upgrade
+        ;;
+    list)
+        (($# == 0)) || die "Usage: labctl pkg list NODE"
+        check_container "$container"
+        "$DOCKER_BIN" exec "$container" apk info
+        ;;
+    *)
+        die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
+        ;;
+    esac
+}
+
+case "${1:-}" in
+status)
+    [[ $# -eq 1 ]] || die "Usage: labctl status"
+    node_status
+    ;;
+
+shell)
+    [[ $# -eq 2 ]] || die "Usage: labctl shell client|filter|server"
+    node_shell "$(get_container "$2")"
+    ;;
+
+info)
+    [[ $# -eq 2 ]] || die "Usage: labctl info client|filter|server"
+    node_info "$(get_container "$2")"
+    ;;
+
+pkg)
+    (($# >= 3)) || die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
+    package_command "$2" "$3" "${@:4}"
     ;;
 
 *)
-    echo "Usage: labctl status | shell client|filter|server" >&2
+    cat >&2 <<'USAGE'
+Usage:
+  labctl status
+  labctl shell client|filter|server
+  labctl info client|filter|server
+  labctl pkg install NODE PACKAGE...
+  labctl pkg upgrade NODE
+  labctl pkg list NODE
+USAGE
     exit 2
     ;;
 esac
