@@ -43,10 +43,10 @@ die() {
 
 get_container() {
     case "${1:-}" in
-        client) printf '%s\n' lab-client ;;
-        filter) printf '%s\n' lab-filter ;;
-        server) printf '%s\n' lab-server ;;
-        *) die "Unknown node: ${1:-<empty>}. Use client, filter or server." ;;
+    client) printf '%s\n' lab-client ;;
+    filter) printf '%s\n' lab-filter ;;
+    server) printf '%s\n' lab-server ;;
+    *) die "Unknown node: ${1:-<empty>}. Use client, filter or server." ;;
     esac
 }
 
@@ -113,46 +113,40 @@ fetch_alpine_packages() (
     local mode="$2"
     shift 2
 
-    local branch arch helper_image workdir
-    local package
+    local branch arch helper_image workdir package
 
     check_container "$container"
 
-    if ! "$DOCKER_BIN" exec "$container" /bin/sh -c \
-        'command -v apk >/dev/null 2>&1'; then
+    "$DOCKER_BIN" exec "$container" /bin/sh -c \
+        'command -v apk >/dev/null 2>&1' ||
         die "$container does not use Alpine Linux / apk."
-    fi
 
     branch="$("$DOCKER_BIN" exec "$container" /bin/sh -c \
         'awk -F. '\''{print "v" $1 "." $2}'\'' /etc/alpine-release')"
-
     arch="$("$DOCKER_BIN" exec "$container" apk --print-arch)"
     helper_image="alpine:${branch#v}"
 
     case "$mode" in
-        install)
-            (($# > 0)) || die "No packages specified."
-            ;;
-        upgrade)
-            (($# == 0)) || die "Unexpected arguments for upgrade."
-            ;;
-        *)
-            die "Internal error: unknown package operation: $mode"
-            ;;
+    install)
+        (($# > 0)) || die "No packages specified."
+        ;;
+    upgrade)
+        (($# == 0)) || die "Unexpected arguments for upgrade."
+        ;;
+    *)
+        die "Internal error: unknown package operation: $mode"
+        ;;
     esac
 
-    # Не допускаем передачу произвольных параметров APK.
     for package in "$@"; do
         [[ "$package" =~ ^[A-Za-z0-9+_.:-]+$ ]] ||
             die "Invalid package name: $package"
     done
 
     workdir="$(mktemp -d "${PACKAGE_CACHE}/.work.XXXXXX")"
-    mkdir -p "$workdir/keys" "$workdir/packages"
+    mkdir -p "$workdir/packages"
 
-    cleanup() {
-        rm -rf -- "$workdir"
-    }
+    cleanup() { rm -rf -- "$workdir"; }
     trap cleanup EXIT
 
     echo "Target: $container"
@@ -160,70 +154,56 @@ fetch_alpine_packages() (
     echo "Architecture: $arch"
     echo "Download helper: $helper_image"
 
-    # Копируем состояние APK целевого контейнера.
+    # Единственный артефакт target, который нам нужен, — список имён
+    # установленных пакетов для режима upgrade.
     "$DOCKER_BIN" cp \
         "$container:/lib/apk/db/installed" \
         "$workdir/installed"
-
-    "$DOCKER_BIN" cp \
-        "$container:/etc/apk/world" \
-        "$workdir/world"
-
-    "$DOCKER_BIN" cp \
-        "$container:/etc/apk/repositories" \
-        "$workdir/repositories"
-
-    "$DOCKER_BIN" cp \
-        "$container:/etc/apk/keys/." \
-        "$workdir/keys/"
 
     "$DOCKER_BIN" pull "$helper_image"
 
     "$DOCKER_BIN" run --rm \
         --network bridge \
         --env "APK_ARCH=$arch" \
+        --env "BRANCH=$branch" \
+        --env "MODE=$mode" \
         --mount "type=bind,src=${workdir},dst=/work" \
         "$helper_image" \
         /bin/sh -ec '
-            ROOT=/work/root
+            set -eu
+            ROOT=/work/staging
+            MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org/alpine}"
 
-            mkdir -p \
-                "$ROOT/lib/apk/db" \
-                "$ROOT/etc/apk/keys" \
-                "$ROOT/var/cache/apk" \
-                "$ROOT/work/packages"
+            mkdir -p "$ROOT/etc/apk" "$ROOT/var/cache/apk" \
+                     "$ROOT/lib/apk/db" /work/packages
 
-            cp /work/installed "$ROOT/lib/apk/db/installed"
-            cp /work/world "$ROOT/etc/apk/world"
-            cp /work/repositories "$ROOT/etc/apk/repositories"
-            cp -a /work/keys/. "$ROOT/etc/apk/keys/"
+            # apk-2.14 требует существующий файл БД даже для update/fetch.
+            : > "$ROOT/lib/apk/db/installed"
+	   : > "$ROOT/etc/apk/world"
 
-            # Временный локальный кэш APK внутри копии root.
-            ln -sfn ../../work/packages "$ROOT/etc/apk/cache"
+            printf "%s/%s/main\n%s/%s/community\n" \
+                "$MIRROR" "$BRANCH" "$MIRROR" "$BRANCH" \
+                > "$ROOT/etc/apk/repositories"
 
             APK="apk --root $ROOT --arch $APK_ARCH \
-                --keys-dir /etc/apk/keys \
-                --repositories-file $ROOT/etc/apk/repositories"
+                 --keys-dir /etc/apk/keys \
+                 --repositories-file $ROOT/etc/apk/repositories"
 
-            # Обновляем индексы репозиториев.
             $APK update
 
-	   for f in "$ROOT"/var/cache/apk/APKINDEX.*.tar.gz; do
-                d=$(mktemp -d)
-	   	tar -xzf "$f" -C "$d"
-	   	sed -i 's/^A:noarch$/A:x86_64/' "$d/APKINDEX"
-	   	tar -czf "$f" -C "$d" APKINDEX
-	   	rm -rf "$d"
-	   done
-
-            # Разрешаем зависимости с учётом установленной системы.
-            if [ "$#" -gt 0 ]; then
-                $APK cache download --add-dependencies "$@"
+            if [ "$MODE" = install ]; then
+                set -- "$@"
             else
-                $APK cache download --upgrade
+                set -- $(awk -F: "/^P:/{print \$2}" /work/installed)
             fi
 
-            cp "$ROOT"/work/packages/*.apk /work/packages/
+            if ! $APK fetch --recursive --output /work/packages "$@"; then
+                echo "Batch fetch failed; retrying per-package..." >&2
+                for p in "$@"; do
+                    $APK fetch --recursive --output /work/packages "$p" || \
+                        echo "  skipped (not in repo): $p" >&2
+                done
+            fi
         ' labctl-fetch "$@"
 
     compgen -G "$workdir/packages/*.apk" >/dev/null ||
@@ -232,22 +212,14 @@ fetch_alpine_packages() (
     echo "Downloaded packages:"
     find "$workdir/packages" -maxdepth 1 -type f -name '*.apk' -printf '  %f\n'
 
-    # Передаём пакеты в целевой узел.
     "$DOCKER_BIN" exec "$container" mkdir -p /tmp/labctl-packages
-
     "$DOCKER_BIN" cp \
         "$workdir/packages/." \
         "$container:/tmp/labctl-packages/"
 
-    # Установка только из локальных файлов.
     "$DOCKER_BIN" exec "$container" /bin/sh -ec '
         set -- /tmp/labctl-packages/*.apk
-
-        [ -f "$1" ] || {
-            echo "No local APK packages found." >&2
-            exit 1
-        }
-
+        [ -f "$1" ] || { echo "No local APK packages found." >&2; exit 1; }
         apk add --no-network "$@"
         rm -rf /tmp/labctl-packages
     '
@@ -264,52 +236,52 @@ package_command() {
     container="$(get_container "$node")"
 
     case "$operation" in
-        install)
-            (($# > 0)) || die "Usage: labctl pkg install NODE PACKAGE..."
-            fetch_alpine_packages "$container" install "$@"
-            ;;
-        upgrade)
-            (($# == 0)) || die "Usage: labctl pkg upgrade NODE"
-            echo "WARNING: this upgrades installed packages in $container."
-            read -r -p "Continue? [y/N] " answer
-            [[ "$answer" == "y" || "$answer" == "Y" ]] ||
-                return 0
-            fetch_alpine_packages "$container" upgrade
-            ;;
-        list)
-            (($# == 0)) || die "Usage: labctl pkg list NODE"
-            check_container "$container"
-            "$DOCKER_BIN" exec "$container" apk info
-            ;;
-        *)
-            die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
-            ;;
+    install)
+        (($# > 0)) || die "Usage: labctl pkg install NODE PACKAGE..."
+        fetch_alpine_packages "$container" install "$@"
+        ;;
+    upgrade)
+        (($# == 0)) || die "Usage: labctl pkg upgrade NODE"
+        echo "WARNING: this upgrades installed packages in $container."
+        read -r -p "Continue? [y/N] " answer
+        [[ "$answer" == "y" || "$answer" == "Y" ]] ||
+            return 0
+        fetch_alpine_packages "$container" upgrade
+        ;;
+    list)
+        (($# == 0)) || die "Usage: labctl pkg list NODE"
+        check_container "$container"
+        "$DOCKER_BIN" exec "$container" apk info
+        ;;
+    *)
+        die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
+        ;;
     esac
 }
 
 case "${1:-}" in
-    status)
-        [[ $# -eq 1 ]] || die "Usage: labctl status"
-        node_status
-        ;;
+status)
+    [[ $# -eq 1 ]] || die "Usage: labctl status"
+    node_status
+    ;;
 
-    shell)
-        [[ $# -eq 2 ]] || die "Usage: labctl shell client|filter|server"
-        node_shell "$(get_container "$2")"
-        ;;
+shell)
+    [[ $# -eq 2 ]] || die "Usage: labctl shell client|filter|server"
+    node_shell "$(get_container "$2")"
+    ;;
 
-    info)
-        [[ $# -eq 2 ]] || die "Usage: labctl info client|filter|server"
-        node_info "$(get_container "$2")"
-        ;;
+info)
+    [[ $# -eq 2 ]] || die "Usage: labctl info client|filter|server"
+    node_info "$(get_container "$2")"
+    ;;
 
-    pkg)
-        (($# >= 3)) || die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
-        package_command "$2" "$3" "${@:4}"
-        ;;
+pkg)
+    (($# >= 3)) || die "Usage: labctl pkg install|upgrade|list NODE [PACKAGE...]"
+    package_command "$2" "$3" "${@:4}"
+    ;;
 
-    *)
-        cat >&2 <<'USAGE'
+*)
+    cat >&2 <<'USAGE'
 Usage:
   labctl status
   labctl shell client|filter|server
@@ -318,6 +290,6 @@ Usage:
   labctl pkg upgrade NODE
   labctl pkg list NODE
 USAGE
-        exit 2
-        ;;
+    exit 2
+    ;;
 esac
