@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -6,81 +5,266 @@ readonly LABCTL="/usr/local/sbin/labctl"
 readonly SUDO="/usr/bin/sudo"
 
 run_labctl() {
-    # Не завершаем меню при ошибке labctl или sudo.
+    local rc
+
     if "$SUDO" -n -u dockerroot "$LABCTL" "$@"; then
         return 0
     else
         rc=$?
-        echo "Lab command failed (exit code: ${rc})." >&2
+        echo
+        echo "Не удалось выполнить команду (код: ${rc})." >&2
         return "$rc"
     fi
 }
 
-choose_node() {
-    local choice
+show_help() {
+    cat <<'EOF'
+
+╔══════════════════════════════════════════════════╗
+║             NETWORK RESEARCH LAB                 ║
+╚══════════════════════════════════════════════════╝
+
+Управление лабораторным стендом.
+
+УЗЛЫ
+  shell client       Открыть терминал клиента
+  shell filter       Открыть терминал фильтра
+  shell server       Открыть терминал сервера
+  status             Проверить состояние узлов
+
+ПАКЕТЫ
+  pkg list NODE                Список установленных пакетов
+  pkg install NODE PACKAGE...  Установить пакет или пакеты
+  pkg upgrade NODE             Обновить пакеты узла
+
+ПРИМЕРЫ
+  pkg install filter tcpdump
+  pkg install client curl bind-tools
+  pkg upgrade filter
+  pkg list server
+
+ПРОЧЕЕ
+  help               Показать эту справку
+  quit               Завершить сеанс
+
+Узлы: client, filter, server
+
+Подсказка: после команды shell вы попадёте внутрь контейнера.
+Чтобы вернуться в меню управления, выйдите из контейнера
+командой exit.
+
+EOF
+}
+
+show_welcome() {
+    echo
+    echo "Добро пожаловать в Network Research Lab!"
+    echo
+    echo "Доступные узлы: client, filter, server"
+    echo "Введите help, чтобы посмотреть команды."
+    echo "Введите status, чтобы проверить состояние стенда."
+    echo
+}
+
+show_node_help() {
+    echo
+    echo "Доступные узлы:"
+    echo "  client  — клиентская машина"
+    echo "  filter  — фильтр трафика и точка захвата PCAP"
+    echo "  server  — серверная машина"
+    echo
+    echo "Пример: shell filter"
+}
+
+show_pkg_help() {
+    echo
+    echo "Управление пакетами:"
+    echo "  pkg list NODE"
+    echo "      Показать установленные пакеты."
+    echo
+    echo "  pkg install NODE PACKAGE..."
+    echo "      Установить один или несколько пакетов."
+    echo
+    echo "  pkg upgrade NODE"
+    echo "      Обновить установленные пакеты."
+    echo
+    echo "Примеры:"
+    echo "  pkg install filter tcpdump"
+    echo "  pkg install client curl bind-tools"
+    echo "  pkg upgrade server"
+    echo
+}
+
+dispatch() {
+    local -a args=("$@")
+    local node
+
+    ((${#args[@]} > 0)) || return 0
+
+    case "${args[0]}" in
+        help|--help|-h)
+            ((${#args[@]} == 1)) || {
+                echo "Использование: help" >&2
+                return 2
+            }
+            show_help
+            ;;
+
+        status)
+            ((${#args[@]} == 1)) || {
+                echo "Использование: status" >&2
+                return 2
+            }
+            echo "Проверяю состояние стенда..."
+            echo
+            run_labctl status
+            ;;
+
+        shell)
+            if ((${#args[@]} != 2)); then
+                show_node_help
+                return 2
+            fi
+
+            node="${args[1]}"
+
+            case "$node" in
+                client|filter|server)
+                    echo "Подключаюсь к $node..."
+                    echo "Для возврата в меню введите exit."
+                    echo
+                    run_labctl shell "$node"
+                    ;;
+                *)
+                    echo "Неизвестный узел: $node" >&2
+                    show_node_help
+                    return 2
+                    ;;
+            esac
+            ;;
+
+        pkg)
+            if ((${#args[@]} < 2)); then
+                show_pkg_help
+                return 2
+            fi
+
+            case "${args[1]}" in
+                list)
+                    if ((${#args[@]} != 3)); then
+                        echo "Укажите узел: pkg list NODE" >&2
+                        show_pkg_help
+                        return 2
+                    fi
+                    echo "Получаю список пакетов узла ${args[2]}..."
+                    run_labctl pkg list "${args[2]}"
+                    ;;
+
+                install)
+                    if ((${#args[@]} < 4)); then
+                        echo "Укажите узел и хотя бы один пакет." >&2
+                        show_pkg_help
+                        return 2
+                    fi
+                    echo "Установка пакетов на узел ${args[2]}..."
+                    echo "Пакеты: ${args[*]:3}"
+                    echo
+                    run_labctl pkg install "${args[@]:2}"
+                    ;;
+
+                upgrade)
+                    if ((${#args[@]} != 3)); then
+                        echo "Укажите узел: pkg upgrade NODE" >&2
+                        show_pkg_help
+                        return 2
+                    fi
+
+                    echo "Внимание: будут обновлены пакеты узла ${args[2]}."
+                    echo "Узел может временно перестать отвечать."
+                    read -r -p "Продолжить? [y/N] " answer
+
+                    case "$answer" in
+                        y|Y|yes|YES|д|Д|да|ДА)
+                            run_labctl pkg upgrade "${args[2]}"
+                            ;;
+                        *)
+                            echo "Обновление отменено."
+                            ;;
+                    esac
+                    ;;
+
+                *)
+                    echo "Неизвестная операция с пакетами: ${args[1]}" >&2
+                    show_pkg_help
+                    return 2
+                    ;;
+            esac
+            ;;
+
+        quit|exit)
+            ((${#args[@]} == 1)) || {
+                echo "Использование: quit" >&2
+                return 2
+            }
+            return 10
+            ;;
+
+        *)
+            echo "Неизвестная команда: ${args[0]}" >&2
+            echo "Введите help, чтобы посмотреть доступные команды."
+            return 2
+            ;;
+    esac
+}
+
+interactive() {
+    local line rc
+    local -a args
+
+    show_welcome
 
     while true; do
-        echo
-        echo "Network research lab"
-        echo "1) client"
-        echo "2) filter"
-        echo "3) server"
-        echo "4) status"
-        echo "q) quit"
-
-        if ! read -r -p "Select: " choice; then
-            # EOF: например, клиент закрыл stdin.
+        if ! read -r -p "lab> " line; then
             echo
-            exit 0
+            break
         fi
 
-        case "$choice" in
-            1)
-                run_labctl shell client || true
-                ;;
-            2)
-                run_labctl shell filter || true
-                ;;
-            3)
-                run_labctl shell server || true
-                ;;
-            4)
-                run_labctl status || true
-                ;;
-            q|Q)
-                exit 0
-                ;;
-            *)
-                echo "Invalid selection." >&2
-                ;;
-        esac
+        [[ -n "$line" ]] || continue
+
+        read -r -a args <<< "$line"
+
+        if dispatch "${args[@]}"; then
+            :
+        else
+            rc=$?
+            [[ "$rc" -eq 10 ]] && break
+        fi
+
+        echo
     done
+
+    echo "Сеанс завершён."
 }
 
 original="${SSH_ORIGINAL_COMMAND:-}"
 
-# Обычный интерактивный SSH: показываем меню.
 if [[ -z "$original" ]]; then
-    choose_node
+    interactive
+    exit 0
 fi
 
-# SSH с удалённой командой: разрешаем только явно перечисленные действия.
-case "$original" in
-    "shell client")
-        exec "$SUDO" -n -u dockerroot "$LABCTL" shell client
-        ;;
-    "shell filter")
-        exec "$SUDO" -n -u dockerroot "$LABCTL" shell filter
-        ;;
-    "shell server")
-        exec "$SUDO" -n -u dockerroot "$LABCTL" shell server
-        ;;
-    "status")
-        exec "$SUDO" -n -u dockerroot "$LABCTL" status
-        ;;
-    *)
-        echo "Command not allowed by the lab gateway." >&2
-        exit 126
-        ;;
-esac
+declare -a args
+read -r -a args <<< "$original"
+
+if ((${#args[@]} == 0)); then
+    exit 0
+fi
+
+if dispatch "${args[@]}"; then
+    exit 0
+else
+    rc=$?
+    [[ "$rc" -eq 10 ]] && exit 0
+    exit "$rc"
+fi
 

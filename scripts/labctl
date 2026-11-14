@@ -108,64 +108,67 @@ node_status() {
 # Загружает пакеты через отдельный Alpine-контейнер.
 # Этот контейнер подключается только к обычной Docker bridge-сети,
 # а не к сетям лабораторных узлов.
-fetch_alpine_packages() {
+fetch_alpine_packages() (
     local container="$1"
     local mode="$2"
     shift 2
 
     local branch arch helper_image workdir
-    local -a packages=()
+    local package
 
     check_container "$container"
 
-    if ! "$DOCKER_BIN" exec "$container" command -v apk >/dev/null 2>&1; then
+    if ! "$DOCKER_BIN" exec "$container" /bin/sh -c \
+        'command -v apk >/dev/null 2>&1'; then
         die "$container does not use Alpine Linux / apk."
     fi
 
     branch="$("$DOCKER_BIN" exec "$container" /bin/sh -c \
-        'awk -F. "{print "v" \$1 "." \$2}" /etc/alpine-release')"
+        'awk -F. '\''{print "v" $1 "." $2}'\'' /etc/alpine-release')"
 
     arch="$("$DOCKER_BIN" exec "$container" apk --print-arch)"
     helper_image="alpine:${branch#v}"
 
     case "$mode" in
     install)
-        packages=("$@")
+        (($# > 0)) || die "No packages specified."
         ;;
     upgrade)
-        mapfile -t packages < <(
-            "$DOCKER_BIN" exec "$container" apk info -e |
-                sed '/^[[:space:]]*$/d'
-        )
-        ((${#packages[@]} > 0)) ||
-            die "Could not obtain installed package list from $container."
+        (($# == 0)) || die "Unexpected arguments for upgrade."
         ;;
     *)
         die "Internal error: unknown package operation: $mode"
         ;;
     esac
 
-    # Не допускаем передачу произвольных параметров apk.
-    local package
-    for package in "${packages[@]}"; do
+    # Не допускаем передачу произвольных параметров APK.
+    for package in "$@"; do
         [[ "$package" =~ ^[A-Za-z0-9+_.:-]+$ ]] ||
             die "Invalid package name: $package"
     done
 
     workdir="$(mktemp -d "${PACKAGE_CACHE}/.work.XXXXXX")"
-    mkdir -p "$workdir/packages" "$workdir/keys"
+    mkdir -p "$workdir/keys" "$workdir/packages"
 
     cleanup() {
         rm -rf -- "$workdir"
     }
-    trap cleanup RETURN
+    trap cleanup EXIT
 
     echo "Target: $container"
     echo "Alpine branch: $branch"
     echo "Architecture: $arch"
     echo "Download helper: $helper_image"
 
-    # Используем конфигурацию репозиториев и доверенные ключи самого узла.
+    # Копируем состояние APK целевого контейнера.
+    "$DOCKER_BIN" cp \
+        "$container:/lib/apk/db/installed" \
+        "$workdir/installed"
+
+    "$DOCKER_BIN" cp \
+        "$container:/etc/apk/world" \
+        "$workdir/world"
+
     "$DOCKER_BIN" cp \
         "$container:/etc/apk/repositories" \
         "$workdir/repositories"
@@ -174,36 +177,66 @@ fetch_alpine_packages() {
         "$container:/etc/apk/keys/." \
         "$workdir/keys/"
 
-    # Образ загрузчика не подключается ни к одной сети стенда.
-    # bridge — отдельная стандартная сеть Docker.
+    # Загрузчик не подключается к сетям лабораторных узлов.
     "$DOCKER_BIN" image inspect "$helper_image" >/dev/null 2>&1 ||
         "$DOCKER_BIN" pull "$helper_image"
 
     "$DOCKER_BIN" run --rm \
         --network bridge \
+        --env "APK_ARCH=$arch" \
         --mount "type=bind,src=${workdir},dst=/work" \
         "$helper_image" \
         /bin/sh -ec '
-            cp /work/repositories /etc/apk/repositories
-            cp -a /work/keys/. /etc/apk/keys/
+            ROOT=/work/root
 
-            apk update
-            apk fetch --recursive --output /work/packages "$@"
-        ' labctl-fetch "${packages[@]}"
+            mkdir -p \
+                "$ROOT/lib/apk/db" \
+                "$ROOT/etc/apk/keys" \
+                "$ROOT/var/cache/apk" \
+                "$ROOT/work/packages"
+
+            cp /work/installed "$ROOT/lib/apk/db/installed"
+            cp /work/world "$ROOT/etc/apk/world"
+            cp /work/repositories "$ROOT/etc/apk/repositories"
+            cp -a /work/keys/. "$ROOT/etc/apk/keys/"
+
+            # Временный локальный кэш APK внутри копии root.
+            ln -sfn ../../work/packages "$ROOT/etc/apk/cache"
+
+            APK="apk --root $ROOT --arch $APK_ARCH \
+                --keys-dir /etc/apk/keys \
+                --repositories-file $ROOT/etc/apk/repositories"
+
+            # Обновляем индексы репозиториев.
+            $APK update
+
+            # Разрешаем зависимости с учётом установленной системы.
+            if [ "$#" -gt 0 ]; then
+                $APK cache download --upgrade --add-dependencies "$@"
+            else
+                $APK cache download --upgrade
+            fi
+
+            cp "$ROOT"/work/packages/*.apk /work/packages/
+        ' labctl-fetch "$@"
 
     compgen -G "$workdir/packages/*.apk" >/dev/null ||
         die "No APK files were downloaded."
 
+    echo "Downloaded packages:"
+    find "$workdir/packages" -maxdepth 1 -type f -name '*.apk' -printf '  %f\n'
+
     # Передаём пакеты в целевой узел.
     "$DOCKER_BIN" exec "$container" mkdir -p /tmp/labctl-packages
+
     "$DOCKER_BIN" cp \
         "$workdir/packages/." \
         "$container:/tmp/labctl-packages/"
 
-    # Устанавливаем исключительно из локальных файлов.
-    # --no-network запрещает apk обращаться к сетевым репозиториям.
+    # Установка только из локальных файлов.
     "$DOCKER_BIN" exec "$container" /bin/sh -ec '
         set -- /tmp/labctl-packages/*.apk
+
         [ -f "$1" ] || {
             echo "No local APK packages found." >&2
             exit 1
@@ -214,7 +247,7 @@ fetch_alpine_packages() {
     '
 
     echo "Package operation completed for $container."
-}
+)
 
 package_command() {
     local operation="${1:-}"
